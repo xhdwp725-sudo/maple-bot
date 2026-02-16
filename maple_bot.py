@@ -1,75 +1,197 @@
-import json
 import os
+import re
 import time
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional
+import json
+from datetime import datetime, timedelta, timezone
 
 import requests
 
+# =========================
+# ✅ 고정 설정 (네 값으로 이미 주입됨)
+# =========================
+DEFAULT_SECRET_TOKEN = "mapleland_2026_02_17_abc123xyz999"
+DEFAULT_SHEETS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbw730jSMIIjf8a6xPe1D8Riv8rnP-9T1vCFMqrkTB_PEUPxkWb1W72nLmnWSGUtv27O/exec"
+
+# 공10 노목(노가다 목장갑) item_code
+DEFAULT_ITEMS = [
+    {
+        "item_code": "1082002",
+        "item_name": "노가다 목장갑(+5)",
+        "side": "sell",  # 팝니다만
+    }
+]
+
+# 몇 초마다 돌릴지 (Railway 환경변수 INTERVAL_SEC 있으면 그걸 사용)
+DEFAULT_INTERVAL_SEC = 300
+
 KST = timezone(timedelta(hours=9))
-
-# ===== 너가 준 값들(완전 삽입됨) =====
-TOKEN = "mapleland_2026_02_17_abc123xyz999"
-SHEETS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbw730jSMIIjf8a6xPe1D8Riv8rnP-9T1vCFMqrkTB_PEUPxkWb1W72nLmnWSGUtv27O/exec"
-
-# 공10 노가다 목장갑(+5) item_code
-ITEM_CODE = "1082002"
-ITEM_NAME = "노가다 목장갑(+5) 공10"
 
 
 def now_kst_str() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def env(name: str, default: Optional[str] = None) -> str:
-    """
-    Railway에서 env 없어서 크래시 난다고 했지?
-    앞으로는 default 주면 크래시 안 나게 처리.
-    """
-    v = os.getenv(name, default)
-    if v is None or v == "":
-        raise RuntimeError(f"Missing env var: {name}")
-    return v
+def env(name: str, default: str) -> str:
+    v = os.getenv(name)
+    if v is None or v.strip() == "":
+        return default
+    return v.strip()
 
 
-def post_to_sheets(side: str, price: int, seller: str = "", note: str = "") -> Dict[str, Any]:
-    payload = {
-        "token": TOKEN,
-        "timestamp": now_kst_str(),
-        "side": side,  # "sell" or "buy"
-        "item_code": ITEM_CODE,
-        "item_name": ITEM_NAME,
-        "price": int(price),
-        "seller": seller,
-        "note": note,
+def load_items() -> list[dict]:
+    """
+    ✅ ITEMS_JSON 환경변수 없어도 동작하게 처리
+    - 있으면 그걸 우선 사용
+    - 없으면 DEFAULT_ITEMS(공10 노목)만 사용
+    """
+    raw = os.getenv("ITEMS_JSON")
+    if raw and raw.strip():
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list) and len(data) > 0:
+                normalized = []
+                for it in data:
+                    if not isinstance(it, dict):
+                        continue
+                    item_code = str(it.get("item_code", "")).strip()
+                    item_name = str(it.get("item_name", "")).strip() or "unknown"
+                    side = str(it.get("side", "sell")).strip().lower()
+                    if item_code:
+                        normalized.append({"item_code": item_code, "item_name": item_name, "side": side})
+                if normalized:
+                    return normalized
+        except Exception:
+            pass
+    return DEFAULT_ITEMS
+
+
+def fetch_html(url: str) -> tuple[int, str]:
+    """
+    403(Forbidden) 최대한 피하려고 브라우저 헤더를 강하게 넣음
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": "https://mapleland.gg/",
+        "Connection": "keep-alive",
     }
+    r = requests.get(url, headers=headers, timeout=25)
+    return r.status_code, r.text
 
+
+def extract_min_sell_price(html: str) -> tuple[int | None, int]:
+    """
+    ✅ 핵심: '팝니다' 영역만 잘라서 가격만 뽑음
+    - '팝니다' ~ '삽니다' 구간에서만 가격 추출
+    - 가격은 47,000,000 형태를 숫자로 변환
+    반환: (min_price, sell_count)
+    """
+    # 영역 자르기 (팝니다 ~ 삽니다)
+    sell_start = html.find("팝니다")
+    if sell_start == -1:
+        return None, 0
+
+    buy_start = html.find("삽니다", sell_start)
+    if buy_start == -1:
+        segment = html[sell_start:]
+    else:
+        segment = html[sell_start:buy_start]
+
+    # 가격 패턴 (콤마 포함 숫자)
+    prices = re.findall(r"(\d{1,3}(?:,\d{3})+)", segment)
+    nums = []
+    for p in prices:
+        try:
+            nums.append(int(p.replace(",", "")))
+        except Exception:
+            continue
+
+    if not nums:
+        return None, 0
+
+    return min(nums), len(nums)
+
+
+def post_to_sheets(webapp_url: str, token: str, payload: dict) -> dict:
     r = requests.post(
-        SHEETS_WEBAPP_URL,
-        data=json.dumps(payload),
-        headers={"Content-Type": "application/json"},
-        timeout=20,
+        webapp_url,
+        json={"token": token, **payload},
+        timeout=25,
     )
     r.raise_for_status()
-    out = r.json()
-    if not out.get("ok"):
-        raise RuntimeError(f"Sheets WebApp returned error: {out}")
-    return out
+    return r.json()
+
+
+def run_once(item: dict, webapp_url: str, token: str) -> None:
+    item_code = item["item_code"]
+    item_name = item["item_name"]
+    side = item.get("side", "sell").lower()
+
+    # Mapleland 아이템 페이지 (네가 쓰던 필터 그대로 유지)
+    url = (
+        f"https://mapleland.gg/item/{item_code}"
+        f"?lowPrice=&highPrice=9999999999"
+        f"&lowincPAD=10&highincPAD=10"
+        f"&lowincPDD=&highincPDD="
+        f"&lowUpgrade=&highUpgrade=5"
+        f"&lowTuc=&highTuc=5"
+        f"&hapStatsName=&lowHapStatsValue=0&highHapStatsValue=0"
+    )
+
+    status, html = fetch_html(url)
+    if status == 403:
+        # 여기서 403이면 사이트가 봇 차단하는 상태
+        print(f"{now_kst_str()} | ERROR | 403 Forbidden for url: {url}")
+        return
+    if status >= 400:
+        print(f"{now_kst_str()} | ERROR | HTTP {status} for url: {url}")
+        return
+
+    min_price, sell_count = extract_min_sell_price(html)
+    if min_price is None:
+        print(f"{now_kst_str()} | ERROR | could not parse sell prices (팝니다) for item_code={item_code}")
+        return
+
+    payload = {
+        "timestamp": now_kst_str(),
+        "item_name": item_name,
+        "item_code": str(item_code),
+        "side": side,                 # ✅ sell 고정
+        "min_price": int(min_price),
+        "sell_count": int(sell_count),
+        "source": "railway-bot",
+    }
+
+    res = post_to_sheets(webapp_url, token, payload)
+    print(f"{now_kst_str()} | OK | posted: {payload['item_code']} min_sell={payload['min_price']} sell_count={sell_count} | res={res}")
 
 
 def main() -> None:
-    """
-    목적: '공10 노목' 데이터를 시트로 보내는 파이프라인을 먼저 "확실히" 성공시킴.
+    token = env("SECRET_TOKEN", DEFAULT_SECRET_TOKEN)
+    webapp_url = env("SHEETS_WEBAPP_URL", DEFAULT_SHEETS_WEBAPP_URL)
 
-    현재 Railway에서 mapleland.gg 직접 크롤링은 403으로 막히는 케이스가 많아서,
-    이 파일은 일단 '시트 전송'을 100% 고정으로 만들고, 이후 데이터 수집부를 붙이는 방식이 안전함.
+    interval_sec = DEFAULT_INTERVAL_SEC
+    v = os.getenv("INTERVAL_SEC")
+    if v and v.strip().isdigit():
+        interval_sec = int(v.strip())
 
-    지금은 테스트로: 팝니다 최저가를 임시 값으로 47,000,000 전송.
-    (너가 원하면 다음 단계에서 수집부를 붙이되, 403 안 나는 방식으로만 설계해야 함.)
-    """
-    test_sell_price = 47000000
-    out = post_to_sheets("sell", test_sell_price, note="pipeline-test")
-    print("OK:", out)
+    items = load_items()
+
+    print(f"{now_kst_str()} | START | ITEMS={len(items)} interval={interval_sec}s")
+    while True:
+        for it in items:
+            try:
+                run_once(it, webapp_url, token)
+            except Exception as e:
+                print(f"{now_kst_str()} | ERROR | loop error: {repr(e)}")
+        time.sleep(interval_sec)
 
 
 if __name__ == "__main__":
