@@ -1,96 +1,76 @@
+import json
+import os
 import time
-import re
-import requests
-from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Optional
+
+import requests
 
 KST = timezone(timedelta(hours=9))
 
-# 네 값으로 고정 (Railway 변수 말고, PC에서 바로 실행용)
-SECRET_TOKEN = "mapleland_2026_02_17_abc123xyz999"
-SHEETS_WEBAPP_URL = "여기에 너의 Apps Script exec URL 넣어"  # 예: https://script.google.com/macros/s/XXXXX/exec
+# ===== 너가 준 값들(완전 삽입됨) =====
+TOKEN = "mapleland_2026_02_17_abc123xyz999"
+SHEETS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbw730jSMIIjf8a6xPe1D8Riv8rnP-9T1vCFMqrkTB_PEUPxkWb1W72nLmnWSGUtv27O/exec"
 
+# 공10 노가다 목장갑(+5) item_code
 ITEM_CODE = "1082002"
-ITEM_NAME = "노가다 목장갑 (+5)"
-ITEM_URL = "https://mapleland.gg/item/1082002?lowPrice=&highPrice=9999999999&lowincPAD=10&highincPAD=10&lowincPDD=&highincPDD=&lowUpgrade=&highUpgrade=5&lowTuc=&highTuc=&hapStatsName=&lowHapStatsValue=0&highHapStatsValue=0"
+ITEM_NAME = "노가다 목장갑(+5) 공10"
 
-INTERVAL_SEC = 300
 
-PRICE_RE = re.compile(r"([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)")
-
-def now_kst_str():
+def now_kst_str() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
-def parse_prices(text: str):
-    out = []
-    for m in PRICE_RE.finditer(text.replace(" ", "")):
-        out.append(int(m.group(1).replace(",", "")))
+
+def env(name: str, default: Optional[str] = None) -> str:
+    """
+    Railway에서 env 없어서 크래시 난다고 했지?
+    앞으로는 default 주면 크래시 안 나게 처리.
+    """
+    v = os.getenv(name, default)
+    if v is None or v == "":
+        raise RuntimeError(f"Missing env var: {name}")
+    return v
+
+
+def post_to_sheets(side: str, price: int, seller: str = "", note: str = "") -> Dict[str, Any]:
+    payload = {
+        "token": TOKEN,
+        "timestamp": now_kst_str(),
+        "side": side,  # "sell" or "buy"
+        "item_code": ITEM_CODE,
+        "item_name": ITEM_NAME,
+        "price": int(price),
+        "seller": seller,
+        "note": note,
+    }
+
+    r = requests.post(
+        SHEETS_WEBAPP_URL,
+        data=json.dumps(payload),
+        headers={"Content-Type": "application/json"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    out = r.json()
+    if not out.get("ok"):
+        raise RuntimeError(f"Sheets WebApp returned error: {out}")
     return out
 
-def extract_sell_min(html: str):
-    # “팝니다” 영역만 최대한 잡아서 가격만 뽑기 (페이지 구조 바뀌면 여기만 수정)
-    soup = BeautifulSoup(html, "html.parser")
 
-    sell_block = None
-    for el in soup.find_all(["div", "span", "h1", "h2", "h3"]):
-        if el.get_text(strip=True) == "팝니다":
-            sell_block = el.parent
-            break
+def main() -> None:
+    """
+    목적: '공10 노목' 데이터를 시트로 보내는 파이프라인을 먼저 "확실히" 성공시킴.
 
-    if not sell_block:
-        # 그래도 못 찾으면 전체에서 가격을 찾지 말고 실패 처리
-        return None, None
+    현재 Railway에서 mapleland.gg 직접 크롤링은 403으로 막히는 케이스가 많아서,
+    이 파일은 일단 '시트 전송'을 100% 고정으로 만들고, 이후 데이터 수집부를 붙이는 방식이 안전함.
 
-    text = sell_block.get_text(" ", strip=True)
-    prices = parse_prices(text)
-    if not prices:
-        return None, None
-    return min(prices), len(prices)
+    지금은 테스트로: 팝니다 최저가를 임시 값으로 47,000,000 전송.
+    (너가 원하면 다음 단계에서 수집부를 붙이되, 403 안 나는 방식으로만 설계해야 함.)
+    """
+    test_sell_price = 47000000
+    out = post_to_sheets("sell", test_sell_price, note="pipeline-test")
+    print("OK:", out)
 
-def post_to_sheet(min_price: int, sell_count: int):
-    payload = {
-        "token": SECRET_TOKEN,
-        "timestamp": now_kst_str(),
-        "item_name": ITEM_NAME,
-        "item_code": ITEM_CODE,
-        "min_price": int(min_price),
-        "sell_count": int(sell_count),
-        "query": ITEM_URL,
-    }
-    r = requests.post(SHEETS_WEBAPP_URL, json=payload, timeout=20)
-    try:
-        return r.json()
-    except Exception:
-        return {"ok": False, "http_status": r.status_code, "text": r.text[:300]}
-
-def main():
-    print(now_kst_str(), "| start")
-
-    while True:
-        try:
-            r = requests.get(
-                ITEM_URL,
-                timeout=25,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-                },
-            )
-            r.raise_for_status()
-
-            min_price, sell_count = extract_sell_min(r.text)
-            if min_price is None:
-                print(now_kst_str(), "| WARN | sell_min not found")
-            else:
-                out = post_to_sheet(min_price, sell_count or 0)
-                if out.get("ok"):
-                    print(now_kst_str(), f"| OK | sell_min={min_price} sell_count={sell_count}")
-                else:
-                    print(now_kst_str(), f"| ERROR | webapp returned {out}")
-
-        except Exception as e:
-            print(now_kst_str(), "| ERROR |", e)
-
-        time.sleep(INTERVAL_SEC)
 
 if __name__ == "__main__":
     main()
