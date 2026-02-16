@@ -1,11 +1,13 @@
 import json
 import os
 import time
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-
+from bs4 import BeautifulSoup
 
 KST = timezone(timedelta(hours=9))
 
@@ -14,190 +16,157 @@ def now_kst_str() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def env(name: str, default: Optional[str] = None) -> str:
+def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
     v = os.getenv(name, default)
-    if v is None or v == "":
+    if (v is None or v == "") and required:
         raise RuntimeError(f"Missing env var: {name}")
-    return v
+    return v or ""
 
 
-def safe_int(x: Any) -> Optional[int]:
-    try:
-        if x is None:
-            return None
-        return int(x)
-    except Exception:
-        return None
+@dataclass
+class Item:
+    item_code: str
+    item_name: str
+    query: str  # full URL or query string
 
 
-def extract_min_sell_price(data: Dict[str, Any]) -> Tuple[Optional[int], int]:
+def load_items() -> List[Item]:
     """
-    Returns (min_sell_price, sell_count).
-
-    Supports common shapes:
-      1) {"sell": [...], "buy": [...]}
-      2) {"sellList": [...], "buyList": [...]}
-      3) {"trades": [...]} where each item indicates side/type
-      4) {"items": [...]} similarly
-
-    Trade item may have price fields like:
-      - "price", "meso", "amount", "tradePrice", "value"
+    Priority:
+      1) ITEMS_JSON env (JSON array)
+      2) ./items.json file (JSON array)
+      3) fallback sample (doesn't crash)
     """
+    raw = os.getenv("ITEMS_JSON", "").strip()
+    if not raw:
+        if os.path.exists("items.json"):
+            with open("items.json", "r", encoding="utf-8") as f:
+                raw = f.read().strip()
 
-    def get_price(x: Dict[str, Any]) -> Optional[int]:
-        for k in ("price", "meso", "amount", "tradePrice", "value"):
-            if k in x and x[k] is not None:
-                p = safe_int(x[k])
-                if isinstance(p, int):
-                    return p
+    if not raw:
+        # fallback (너가 나중에 Railway에 ITEMS_JSON 넣으면 자동으로 이건 안 씀)
+        return [
+            Item(
+                item_code="1082002",
+                item_name="노가다 목장갑 (+5)",
+                query="https://mapleland.gg/item/1082002?lowPrice=&highPrice=9999999999&lowincPAD=10&highincPAD=10&lowincPDD=&highincPDD=&lowUpgrade=&highUpgrade=5&lowTuc=&highTuc=&hapStatsName=&lowHapStatsValue=0&highHapStatsValue=0"
+            )
+        ]
+
+    data = json.loads(raw)
+    items: List[Item] = []
+    for x in data:
+        items.append(Item(
+            item_code=str(x.get("item_code", "")).strip(),
+            item_name=str(x.get("item_name", "")).strip(),
+            query=str(x.get("query", "")).strip(),
+        ))
+    # basic validation
+    items = [it for it in items if it.item_code and it.item_name and it.query]
+    if not items:
+        raise RuntimeError("ITEMS_JSON parsed but no valid items found.")
+    return items
+
+
+PRICE_RE = re.compile(r"([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)")
+
+def parse_int_price(text: str) -> Optional[int]:
+    m = PRICE_RE.search(text.replace(" ", ""))
+    if not m:
         return None
+    return int(m.group(1).replace(",", ""))
 
-    def is_sell(x: Dict[str, Any]) -> Optional[bool]:
-        for k in ("type", "tradeType", "side", "buySell", "mode"):
-            v = x.get(k)
-            if isinstance(v, str):
-                vv = v.strip().lower()
-                if vv in ("sell", "seller", "s", "판매", "sellorder", "sell_order", "ask"):
-                    return True
-                if vv in ("buy", "buyer", "b", "구매", "buyorder", "buy_order", "bid"):
-                    return False
-        if x.get("isSell") is True:
-            return True
-        if x.get("isBuy") is True:
-            return False
-        return None
 
-    sell_list: Optional[List[Any]] = None
+def extract_sell_min_from_html(html: str) -> Tuple[Optional[int], Optional[int]]:
+    """
+    '팝니다' 컬럼만 보고 최저가(min_price)와 판매글 수(sell_count)를 뽑는다.
+    페이지 구조가 바뀌면 여기만 손보면 됨.
+    """
+    soup = BeautifulSoup(html, "html.parser")
 
-    # split lists
-    for key in ("sell", "sellList", "sells", "sellItems"):
-        if isinstance(data.get(key), list):
-            sell_list = data[key]
+    # 1) "팝니다" 섹션 찾기 (텍스트 기반)
+    sell_section = None
+    for h in soup.find_all(["div", "h1", "h2", "h3", "span"]):
+        if h.get_text(strip=True) == "팝니다":
+            # 보통 이 헤더의 부모/근처가 리스트 컨테이너
+            sell_section = h.parent
             break
+    if sell_section is None:
+        # fallback: 전체에서 '팝니다'가 있는 큰 블록을 찾기
+        txt = soup.get_text(" ", strip=True)
+        # 못 찾으면 None
+        return None, None
 
-    # unified list
-    if sell_list is None:
-        for key in ("trades", "items", "list", "data", "result"):
-            if isinstance(data.get(key), list):
-                candidates = data[key]
-                sell_list = []
-                for x in candidates:
-                    if isinstance(x, dict):
-                        flag = is_sell(x)
-                        if flag is True:
-                            sell_list.append(x)
-                break
+    # 2) 해당 섹션 내부에서 가격 후보 수집
+    text_block = sell_section.get_text(" ", strip=True)
 
-    if not sell_list:
-        return (None, 0)
+    # 가격들 추출
+    prices = []
+    for m in PRICE_RE.finditer(text_block):
+        prices.append(int(m.group(1).replace(",", "")))
 
-    prices: List[int] = []
-    for x in sell_list:
-        if isinstance(x, dict):
-            p = get_price(x)
-            if isinstance(p, int):
-                prices.append(p)
+    min_price = min(prices) if prices else None
 
-    if not prices:
-        return (None, len(sell_list))
+    # 판매글 수(대충) = 가격 후보 개수로 근사 (페이지 구조 정확히 알면 여기 개선)
+    sell_count = len(prices) if prices else None
 
-    return (min(prices), len(sell_list))
+    return min_price, sell_count
 
 
-def build_trade_url(item_code: str, query: str) -> str:
-    """
-    너가 이미 쓰고 있는 mapleland.gg 파라미터 스트링(query)을 그대로 붙여서 호출하는 방식.
-    query 예시:
-      "lowPrice=&highPrice=9999999999&lowincPAD=10&highincPAD=10&lowincPDD=&highincPDD=&lowUpgrade=&highUpgrade=&lowTuc=&highTuc=5&hapStatsName=&lowHapStatsValue=0&highHapStatsValue=0"
-    """
-    base = f"https://api.mapleland.gg/trade"
-    if query.startswith("?"):
-        query = query[1:]
-    return f"{base}?{query}&itemCode={item_code}"
-
-
-def post_to_sheets(webapp_url: str, token: str, payload: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]:
-    r = requests.post(webapp_url, json={"token": token, **payload}, timeout=timeout)
+def post_to_sheets(webapp_url: str, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    r = requests.post(webapp_url, json={"token": token, **payload}, timeout=20)
     try:
         return r.json()
     except Exception:
-        return {"ok": False, "error": f"non_json_response status={r.status_code} text={r.text[:200]}"}
+        return {"ok": False, "http_status": r.status_code, "text": r.text[:500]}
 
 
-def fetch_trade_json(url: str, timeout: int = 15) -> Dict[str, Any]:
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+def main() -> None:
+    # required
+    token = env("SECRET_TOKEN", required=True)
+    webapp_url = env("SHEETS_WEBAPP_URL", required=True)
 
-
-def load_items() -> List[Dict[str, str]]:
-    """
-    ITEMS_JSON 환경변수에 아래 같은 형태로 넣는 걸 전제로 함.
-    [
-      {"item_code":"1082002","item_name":"노가다 목장갑 (+5) 공10","query":"lowPrice=&highPrice=9999999999&lowincPAD=10&highincPAD=10&lowincPDD=&highincPDD=&lowUpgrade=&highUpgrade=&lowTuc=&highTuc=5&hapStatsName=&lowHapStatsValue=0&highHapStatsValue=0"},
-      ...
-    ]
-    """
-    raw = env("ITEMS_JSON")
-    items = json.loads(raw)
-    if not isinstance(items, list) or len(items) == 0:
-        raise RuntimeError("ITEMS_JSON must be a non-empty list")
-    out: List[Dict[str, str]] = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        item_code = str(it.get("item_code", "")).strip()
-        item_name = str(it.get("item_name", "")).strip()
-        query = str(it.get("query", "")).strip()
-        if not item_code or not item_name or not query:
-            raise RuntimeError(f"Bad item entry in ITEMS_JSON: {it}")
-        out.append({"item_code": item_code, "item_name": item_name, "query": query})
-    return out
-
-
-def main():
-    secret_token = env("SECRET_TOKEN")
-    sheets_webapp_url = env("SHEETS_WEBAPP_URL")
-    interval = int(os.getenv("INTERVAL_SECONDS", "300"))
+    # optional
+    interval = int(env("INTERVAL_SEC", "300") or "300")
 
     items = load_items()
 
-    print(f"{now_kst_str()} | INFO | start | ITEMS={len(items)} | interval={interval}s")
+    print(f"{now_kst_str()} | INFO | ITEMS={len(items)} interval={interval}s")
 
     while True:
         for it in items:
-            item_code = it["item_code"]
-            item_name = it["item_name"]
-            query = it["query"]
-
-            url = build_trade_url(item_code, query)
-
             try:
-                data = fetch_trade_json(url)
-                min_sell, sell_count = extract_min_sell_price(data)
+                # fetch
+                resp = requests.get(it.query, timeout=25, headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; maple-bot/1.0)"
+                })
+                resp.raise_for_status()
 
-                if min_sell is None:
-                    print(f"{now_kst_str()} | WARN | no_sell_price | {item_name}({item_code})")
+                # parse sell only
+                min_price, sell_count = extract_sell_min_from_html(resp.text)
+
+                if min_price is None:
+                    print(f"{now_kst_str()} | WARN | {it.item_name}({it.item_code}) sell_min not found")
                     continue
 
                 payload = {
                     "timestamp": now_kst_str(),
-                    "item_name": item_name,
-                    "item_code": item_code,
-                    "query": query,
-                    "min_price": int(min_sell),
-                    "sell_count": int(sell_count),
+                    "item_name": it.item_name,
+                    "item_code": it.item_code,
+                    "min_price": int(min_price),
+                    "sell_count": int(sell_count) if sell_count is not None else "",
+                    "query": it.query,
                 }
 
-                resp = post_to_sheets(sheets_webapp_url, secret_token, payload)
+                out = post_to_sheets(webapp_url, token, payload)
 
-                if not resp.get("ok"):
-                    print(f"{now_kst_str()} | ERROR | sheets | {item_name}({item_code}) | resp={resp}")
+                if not out.get("ok"):
+                    print(f"{now_kst_str()} | ERROR | Sheets WebApp returned error: {out}")
                 else:
-                    print(f"{now_kst_str()} | INFO | {item_name}({item_code}) | sell_min={min_sell:,} | sell_cnt={sell_count}")
+                    print(f"{now_kst_str()} | OK | {it.item_name}({it.item_code}) sell_min={min_price} sell_count={sell_count}")
 
             except Exception as e:
-                print(f"{now_kst_str()} | ERROR | loop | {item_name}({item_code}) | {e}")
+                print(f"{now_kst_str()} | ERROR | loop error: {e}")
 
         time.sleep(interval)
 
