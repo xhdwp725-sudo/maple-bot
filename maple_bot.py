@@ -1,175 +1,96 @@
-import json
-import os
 import time
 import re
-from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
-
 import requests
 from bs4 import BeautifulSoup
+from datetime import datetime, timezone, timedelta
 
 KST = timezone(timedelta(hours=9))
 
+# 네 값으로 고정 (Railway 변수 말고, PC에서 바로 실행용)
+SECRET_TOKEN = "mapleland_2026_02_17_abc123xyz999"
+SHEETS_WEBAPP_URL = "여기에 너의 Apps Script exec URL 넣어"  # 예: https://script.google.com/macros/s/XXXXX/exec
 
-def now_kst_str() -> str:
-    return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+ITEM_CODE = "1082002"
+ITEM_NAME = "노가다 목장갑 (+5)"
+ITEM_URL = "https://mapleland.gg/item/1082002?lowPrice=&highPrice=9999999999&lowincPAD=10&highincPAD=10&lowincPDD=&highincPDD=&lowUpgrade=&highUpgrade=5&lowTuc=&highTuc=&hapStatsName=&lowHapStatsValue=0&highHapStatsValue=0"
 
-
-def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
-    v = os.getenv(name, default)
-    if (v is None or v == "") and required:
-        raise RuntimeError(f"Missing env var: {name}")
-    return v or ""
-
-
-@dataclass
-class Item:
-    item_code: str
-    item_name: str
-    query: str  # full URL or query string
-
-
-def load_items() -> List[Item]:
-    """
-    Priority:
-      1) ITEMS_JSON env (JSON array)
-      2) ./items.json file (JSON array)
-      3) fallback sample (doesn't crash)
-    """
-    raw = os.getenv("ITEMS_JSON", "").strip()
-    if not raw:
-        if os.path.exists("items.json"):
-            with open("items.json", "r", encoding="utf-8") as f:
-                raw = f.read().strip()
-
-    if not raw:
-        # fallback (너가 나중에 Railway에 ITEMS_JSON 넣으면 자동으로 이건 안 씀)
-        return [
-            Item(
-                item_code="1082002",
-                item_name="노가다 목장갑 (+5)",
-                query="https://mapleland.gg/item/1082002?lowPrice=&highPrice=9999999999&lowincPAD=10&highincPAD=10&lowincPDD=&highincPDD=&lowUpgrade=&highUpgrade=5&lowTuc=&highTuc=&hapStatsName=&lowHapStatsValue=0&highHapStatsValue=0"
-            )
-        ]
-
-    data = json.loads(raw)
-    items: List[Item] = []
-    for x in data:
-        items.append(Item(
-            item_code=str(x.get("item_code", "")).strip(),
-            item_name=str(x.get("item_name", "")).strip(),
-            query=str(x.get("query", "")).strip(),
-        ))
-    # basic validation
-    items = [it for it in items if it.item_code and it.item_name and it.query]
-    if not items:
-        raise RuntimeError("ITEMS_JSON parsed but no valid items found.")
-    return items
-
+INTERVAL_SEC = 300
 
 PRICE_RE = re.compile(r"([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)")
 
-def parse_int_price(text: str) -> Optional[int]:
-    m = PRICE_RE.search(text.replace(" ", ""))
-    if not m:
-        return None
-    return int(m.group(1).replace(",", ""))
+def now_kst_str():
+    return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
+def parse_prices(text: str):
+    out = []
+    for m in PRICE_RE.finditer(text.replace(" ", "")):
+        out.append(int(m.group(1).replace(",", "")))
+    return out
 
-def extract_sell_min_from_html(html: str) -> Tuple[Optional[int], Optional[int]]:
-    """
-    '팝니다' 컬럼만 보고 최저가(min_price)와 판매글 수(sell_count)를 뽑는다.
-    페이지 구조가 바뀌면 여기만 손보면 됨.
-    """
+def extract_sell_min(html: str):
+    # “팝니다” 영역만 최대한 잡아서 가격만 뽑기 (페이지 구조 바뀌면 여기만 수정)
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) "팝니다" 섹션 찾기 (텍스트 기반)
-    sell_section = None
-    for h in soup.find_all(["div", "h1", "h2", "h3", "span"]):
-        if h.get_text(strip=True) == "팝니다":
-            # 보통 이 헤더의 부모/근처가 리스트 컨테이너
-            sell_section = h.parent
+    sell_block = None
+    for el in soup.find_all(["div", "span", "h1", "h2", "h3"]):
+        if el.get_text(strip=True) == "팝니다":
+            sell_block = el.parent
             break
-    if sell_section is None:
-        # fallback: 전체에서 '팝니다'가 있는 큰 블록을 찾기
-        txt = soup.get_text(" ", strip=True)
-        # 못 찾으면 None
+
+    if not sell_block:
+        # 그래도 못 찾으면 전체에서 가격을 찾지 말고 실패 처리
         return None, None
 
-    # 2) 해당 섹션 내부에서 가격 후보 수집
-    text_block = sell_section.get_text(" ", strip=True)
+    text = sell_block.get_text(" ", strip=True)
+    prices = parse_prices(text)
+    if not prices:
+        return None, None
+    return min(prices), len(prices)
 
-    # 가격들 추출
-    prices = []
-    for m in PRICE_RE.finditer(text_block):
-        prices.append(int(m.group(1).replace(",", "")))
-
-    min_price = min(prices) if prices else None
-
-    # 판매글 수(대충) = 가격 후보 개수로 근사 (페이지 구조 정확히 알면 여기 개선)
-    sell_count = len(prices) if prices else None
-
-    return min_price, sell_count
-
-
-def post_to_sheets(webapp_url: str, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    r = requests.post(webapp_url, json={"token": token, **payload}, timeout=20)
+def post_to_sheet(min_price: int, sell_count: int):
+    payload = {
+        "token": SECRET_TOKEN,
+        "timestamp": now_kst_str(),
+        "item_name": ITEM_NAME,
+        "item_code": ITEM_CODE,
+        "min_price": int(min_price),
+        "sell_count": int(sell_count),
+        "query": ITEM_URL,
+    }
+    r = requests.post(SHEETS_WEBAPP_URL, json=payload, timeout=20)
     try:
         return r.json()
     except Exception:
-        return {"ok": False, "http_status": r.status_code, "text": r.text[:500]}
+        return {"ok": False, "http_status": r.status_code, "text": r.text[:300]}
 
-
-def main() -> None:
-    # required
-    token = env("SECRET_TOKEN", required=True)
-    webapp_url = env("SHEETS_WEBAPP_URL", required=True)
-
-    # optional
-    interval = int(env("INTERVAL_SEC", "300") or "300")
-
-    items = load_items()
-
-    print(f"{now_kst_str()} | INFO | ITEMS={len(items)} interval={interval}s")
+def main():
+    print(now_kst_str(), "| start")
 
     while True:
-        for it in items:
-            try:
-                # fetch
-                resp = requests.get(it.query, timeout=25, headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; maple-bot/1.0)"
-                })
-                resp.raise_for_status()
+        try:
+            r = requests.get(
+                ITEM_URL,
+                timeout=25,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+                },
+            )
+            r.raise_for_status()
 
-                # parse sell only
-                min_price, sell_count = extract_sell_min_from_html(resp.text)
-
-                if min_price is None:
-                    print(f"{now_kst_str()} | WARN | {it.item_name}({it.item_code}) sell_min not found")
-                    continue
-
-                payload = {
-                    "timestamp": now_kst_str(),
-                    "item_name": it.item_name,
-                    "item_code": it.item_code,
-                    "min_price": int(min_price),
-                    "sell_count": int(sell_count) if sell_count is not None else "",
-                    "query": it.query,
-                }
-
-                out = post_to_sheets(webapp_url, token, payload)
-
-                if not out.get("ok"):
-                    print(f"{now_kst_str()} | ERROR | Sheets WebApp returned error: {out}")
+            min_price, sell_count = extract_sell_min(r.text)
+            if min_price is None:
+                print(now_kst_str(), "| WARN | sell_min not found")
+            else:
+                out = post_to_sheet(min_price, sell_count or 0)
+                if out.get("ok"):
+                    print(now_kst_str(), f"| OK | sell_min={min_price} sell_count={sell_count}")
                 else:
-                    print(f"{now_kst_str()} | OK | {it.item_name}({it.item_code}) sell_min={min_price} sell_count={sell_count}")
+                    print(now_kst_str(), f"| ERROR | webapp returned {out}")
 
-            except Exception as e:
-                print(f"{now_kst_str()} | ERROR | loop error: {e}")
+        except Exception as e:
+            print(now_kst_str(), "| ERROR |", e)
 
-        time.sleep(interval)
-
+        time.sleep(INTERVAL_SEC)
 
 if __name__ == "__main__":
     main()
