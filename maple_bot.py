@@ -1,7 +1,7 @@
 import requests
 import time
 
-URL = "여기에_니_API_URL_그대로"
+URL = "https://mapleland.gg/item/1082002?lowPrice=&highPrice=9999999999&lowincPAD=10&highincPAD=10&lowincMAD=&highincMAD=&lowincPDD=&highincPDD=&lowUpgrade=&highUpgrade=5&lowTuc=&highTuc=5&hapStatsName=&lowHapStatsValue=0&highHapStatsValue=0"
 
 def fetch():
     res = requests.get(URL, timeout=15)
@@ -41,3 +41,4 @@ if __name__ == "__main__":
     while True:
         main()
         time.sleep(300)
+
