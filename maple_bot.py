@@ -1,134 +1,157 @@
 import os
 import time
+import requests
+from urllib.parse import urlparse, parse_qs, urlencode
 from datetime import datetime, timezone, timedelta
 
-import requests
+# 네가 준 페이지 URL (필터 포함)
+PAGE_URL = "https://mapleland.gg/item/1082002?lowPrice=&highPrice=9999999999&lowincPAD=10&highincPAD=10&lowincMAD=&highincMAD=&lowincPDD=&highincPDD=&lowUpgrade=&highUpgrade=5&lowTuc=&highTuc=5&hapStatsName=&lowHapStatsValue=0&highHapStatsValue=0"
 
+# 5분마다 수집
+INTERVAL_SEC = 300
 
 KST = timezone(timedelta(hours=9))
 
-# ✅ 네가 준 "정답 API"
-API_URL = "https://api.mapleland.gg/trade?itemCode=1082002"
 
-# 5분마다
-INTERVAL_SEC = 300
-
-
-def is_sell_trade(obj: dict) -> bool:
+def to_api_url(page_url: str) -> str:
     """
-    서버 응답에 따라 키 이름이 다를 수 있어서,
-    '팝니다' 성격으로 보이는 케이스를 최대한 폭넓게 잡는다.
-    (그래도 서버가 완전 다른 형태면 로그로 확인 가능하게 해둠)
+    mapleland.gg/item/... 페이지 URL을
+    api.mapleland.gg/trade 호출 URL로 변환 (쿼리 파라미터 유지)
     """
-    # 1) 가장 흔한 케이스들
-    for k in ("tradeType", "type", "side", "direction"):
-        v = obj.get(k)
-        if v is None:
-            continue
-        # 문자열형
-        if isinstance(v, str):
-            s = v.lower()
-            if s in ("sell", "seller", "s", "sale"):
-                return True
-            if s in ("buy", "buyer", "b"):
-                return False
-        # 숫자형 (0/1 류)
-        if isinstance(v, (int, float)):
-            # 보통 0=SELL, 1=BUY 혹은 반대인데 서비스마다 다름.
-            # 여기선 안전하게: SELL로 확정되는 값만 True, BUY로 확정되는 값만 False
-            # (애매하면 아래 fallback로 넘김)
-            if v == 0:
-                return True
-            if v == 1:
-                return False
+    u = urlparse(page_url)
+    qs = parse_qs(u.query)
 
-    # 2) boolean 플래그
-    for k in ("isSell", "sell", "isSelling"):
-        v = obj.get(k)
-        if isinstance(v, bool):
-            return v
+    # itemCode 추출: /item/1082002 형태
+    parts = [p for p in u.path.split("/") if p]
+    if len(parts) >= 2 and parts[0] == "item":
+        item_code = parts[1]
+    else:
+        # 혹시 itemCode가 쿼리에 들어있는 형태면 그걸 사용
+        item_code = (qs.get("itemCode") or [None])[0]
 
-    # 3) fallback: 구매글에만 있는 필드/판매글에만 있는 필드가 있으면 판별
-    # (여긴 데이터 보고 튜닝 가능)
-    for k in ("buyMessage", "wantToBuy", "buyer"):
-        if k in obj and obj.get(k):
-            return False
-    for k in ("sellMessage", "selling", "seller"):
-        if k in obj and obj.get(k):
-            return True
+    if not item_code:
+        raise ValueError("itemCode를 찾지 못했어. PAGE_URL 경로(/item/1082002) 확인해줘.")
 
-    # 4) 끝까지 모르겠으면 False 처리(=판매로 잡지 않음)
-    return False
+    # API는 itemCode가 필수
+    qs["itemCode"] = [item_code]
+
+    # parse_qs는 값이 list라서 urlencode(doseq=True)로 처리
+    api_query = urlencode(qs, doseq=True)
+    return f"https://api.mapleland.gg/trade?{api_query}"
 
 
-def extract_price(obj: dict):
-    # mapleland 쪽에서 자주 쓰는 후보들
-    for k in ("itemPrice", "price", "tradePrice"):
-        v = obj.get(k)
-        if isinstance(v, (int, float)):
-            return int(v)
-        if isinstance(v, str) and v.isdigit():
-            return int(v)
+def pick_price_field(obj: dict):
+    """
+    가격 필드 이름이 환경/버전에 따라 다를 수 있어서 후보를 여러 개로 둠.
+    """
+    for key in ("itemPrice", "price", "tradePrice", "sellPrice", "amount"):
+        if key in obj and obj[key] is not None:
+            return obj[key]
     return None
 
 
-def fetch_json() -> list[dict]:
+def is_sell_listing(obj: dict) -> bool:
+    """
+    '팝니다(판매)'만 남기려고 최대한 방어적으로 판별.
+    API 응답 구조가 바뀌어도 어느 정도 버팀.
+    """
+    # 흔한 케이스들
+    if "isBuy" in obj:
+        return obj["isBuy"] is False
+    if "isSell" in obj:
+        return obj["isSell"] is True
+    if "tradeType" in obj:
+        v = str(obj["tradeType"]).lower()
+        return v in ("sell", "seller", "sale")
+    if "type" in obj:
+        v = str(obj["type"]).lower()
+        return v in ("sell", "seller", "sale")
+
+    # fallback: buy 관련 키가 있으면 구매로 간주
+    buyish_keys = ("buyer", "buy", "buyPrice")
+    for k in buyish_keys:
+        if k in obj:
+            return False
+
+    # 그래도 모르면 "판매로 추정"하지 말고 True로 두면 섞일 수 있어서,
+    # 안전하게 False로 둠 (섞임 방지 우선)
+    return False
+
+
+def fetch_json(api_url: str):
     headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; maple-bot/1.0)",
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (maple-bot)",
         "Referer": "https://mapleland.gg/",
     }
-    r = requests.get(API_URL, headers=headers, timeout=20)
+    r = requests.get(api_url, headers=headers, timeout=20)
     r.raise_for_status()
-    data = r.json()
-
-    # 응답이 리스트가 아닐 수도 있어서 방어
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        # 흔한 래핑 형태들
-        for k in ("data", "items", "result", "trades"):
-            v = data.get(k)
-            if isinstance(v, list):
-                return v
-    return []
+    return r.json()
 
 
-def main_once():
-    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        data = fetch_json()
-        if not data:
-            print(f"[{now}] 데이터 없음")
-            return
+def format_num(n: int) -> str:
+    return f"{n:,}"
 
-        sells = []
-        for obj in data:
-            if not isinstance(obj, dict):
+
+def main():
+    # 필요하면 Railway Variables에서 PAGE_URL을 덮어쓸 수 있게 해둠
+    page_url = os.getenv("PAGE_URL", PAGE_URL).strip()
+    api_url = to_api_url(page_url)
+
+    print("수집 시작")
+    print("API_URL =", api_url)
+
+    while True:
+        ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            data = fetch_json(api_url)
+
+            # 응답이 리스트가 아닐 수도 있어서 정규화
+            if isinstance(data, dict):
+                # 흔한 형태들 시도
+                for k in ("data", "items", "result", "list"):
+                    if k in data and isinstance(data[k], list):
+                        data = data[k]
+                        break
+
+            if not isinstance(data, list) or not data:
+                print(f"[{ts}] 데이터 없음(빈 응답)")
+                time.sleep(INTERVAL_SEC)
                 continue
-            if not is_sell_trade(obj):
-                continue
-            price = extract_price(obj)
-            if price is None:
-                continue
-            sells.append(price)
 
-        if not sells:
-            # 판매만 필터했더니 0개면, 서버 필드가 다를 수 있어서 디버그 힌트 출력
-            sample = next((x for x in data if isinstance(x, dict)), {})
-            keys = list(sample.keys())[:30]
-            print(f"[{now}] 판매 데이터 0개(구분필드 불일치 가능). 샘플키: {keys}")
-            return
+            # 판매만 추출
+            sells = [x for x in data if isinstance(x, dict) and is_sell_listing(x)]
 
-        min_price = min(sells)
-        print(f"[{now}] 판매 최저가: {min_price}")
+            # 만약 sell 판별이 전부 실패하면(구조가 다른 경우),
+            # 그때만 전체에서 가격 후보를 뽑되, 섞일 가능성 경고를 출력
+            target = sells if sells else data
 
-    except Exception as e:
-        print(f"[{now}] 오류: {e}")
+            prices = []
+            for obj in target:
+                if not isinstance(obj, dict):
+                    continue
+                p = pick_price_field(obj)
+                if p is None:
+                    continue
+                try:
+                    prices.append(int(p))
+                except Exception:
+                    continue
+
+            if not prices:
+                label = "판매" if sells else "전체(판매판별 실패)"
+                print(f"[{ts}] {label} 가격 필드 못 찾음")
+            else:
+                best = min(prices)
+                label = "판매" if sells else "전체(판매판별 실패)"
+                print(f"[{ts}] {label} 최저가: {format_num(best)}")
+
+        except Exception as e:
+            print(f"[{ts}] 오류:", repr(e))
+
+        time.sleep(INTERVAL_SEC)
 
 
 if __name__ == "__main__":
-    print("수집 시작")
-    while True:
-        main_once()
-        time.sleep(INTERVAL_SEC)
+    main()
