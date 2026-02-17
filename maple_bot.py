@@ -29,10 +29,6 @@ PARAMS = {
 INTERVAL = 300  # 5분
 
 
-# ==============================
-# 가격 가져오기
-# ==============================
-
 def get_min_price():
     try:
         res = requests.get(API_URL, params=PARAMS, timeout=15)
@@ -53,10 +49,6 @@ def get_min_price():
         return None
 
 
-# ==============================
-# 스프레드시트 전송
-# ==============================
-
 def send_to_sheet(price):
     try:
         payload = {
@@ -75,10 +67,6 @@ def send_to_sheet(price):
         print("시트 전송 실패:", e)
 
 
-# ==============================
-# 메인 루프
-# ==============================
-
 def main():
     print("START: maple bot running")
 
@@ -96,4 +84,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
